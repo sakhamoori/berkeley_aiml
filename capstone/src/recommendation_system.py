@@ -11,9 +11,11 @@ import tempfile
 import time
 import pickle
 from pathlib import Path
+from sklearn.neighbors import NearestNeighbors
+from scipy.sparse import lil_matrix
 
 class RecommendationSystem:
-    def __init__(self, use_gpu=False, batch_size=10000, temp_dir=None, timeout=3600):
+    def __init__(self, use_gpu=False, batch_size=10000, temp_dir=None, timeout=3600, top_k=10):
         """
         Initialize the recommendation system
         
@@ -27,6 +29,8 @@ class RecommendationSystem:
             Directory to store temporary files. If None, uses system temp directory
         timeout : int, default=3600
             Maximum time in seconds to process each major step
+        top_k : int, default=10
+            Number of top similar users to keep in the sparse similarity matrix
         """
         self.user_item_matrix = None
         self.item_similarity_matrix = None
@@ -40,6 +44,8 @@ class RecommendationSystem:
         self.temp_dir = tempfile.mkdtemp() if temp_dir is None else temp_dir
         self.timeout = timeout
         self.checkpoint_dir = os.path.join(self.temp_dir, 'checkpoints')
+        self.start_time = None
+        self.top_k = top_k
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         
     def _get_memory_usage(self):
@@ -77,7 +83,7 @@ class RecommendationSystem:
         
     def fit(self, df):
         """Fit the recommendation system using batch processing"""
-        start_time = time.time()
+        self.start_time = time.time()
         print(f"Initial memory usage: {self._get_memory_usage():.2f} GB")
         
         # Check for existing checkpoints
@@ -106,7 +112,7 @@ class RecommendationSystem:
         
         # Process batches
         for i in tqdm(range(n_batches), desc="Processing batches"):
-            if time.time() - start_time > self.timeout:
+            if time.time() - self.start_time > self.timeout:
                 print("Timeout reached. Saving progress...")
                 save_npz(matrix_path, self.user_item_matrix)
                 raise TimeoutError("Processing timeout reached")
@@ -133,25 +139,38 @@ class RecommendationSystem:
         self._calculate_similarities_chunked()
         
     def _calculate_similarities_chunked(self):
-        """Calculate similarities using chunked processing"""
+        """Calculate similarities using sparse top-k user similarity matrix"""
         n_items = len(self.item_mapping)
         n_users = len(self.user_mapping)
-        chunk_size = 500  # Reduced chunk size for better memory management
+        chunk_size = 500  # For item similarity, keep as is for now
+        save_chunk_size = 100
         
         # Calculate item similarities in chunks
         print("Calculating item similarities...")
-        item_sim_path = os.path.join(self.checkpoint_dir, 'item_similarity.npy')
+        item_sim_dir = os.path.join(self.checkpoint_dir, 'item_similarity_chunks')
+        os.makedirs(item_sim_dir, exist_ok=True)
         
-        if os.path.exists(item_sim_path):
-            print("Loading existing item similarity matrix...")
-            self.item_similarity_matrix = np.load(item_sim_path)
+        # Check for existing chunks
+        existing_chunks = sorted([f for f in os.listdir(item_sim_dir) if f.startswith('chunk_')])
+        if existing_chunks:
+            print("Loading existing item similarity chunks...")
+            self.item_similarity_matrix = np.zeros((n_items, n_items))
+            for chunk_file in existing_chunks:
+                chunk_idx = int(chunk_file.split('_')[1].split('.')[0])
+                chunk_data = np.load(os.path.join(item_sim_dir, chunk_file))
+                start_idx = chunk_idx * save_chunk_size
+                end_idx = min(start_idx + save_chunk_size, n_items)
+                self.item_similarity_matrix[start_idx:end_idx, :] = chunk_data
         else:
             self.item_similarity_matrix = np.zeros((n_items, n_items))
         
         for i in tqdm(range(0, n_items, chunk_size), desc="Processing item chunks"):
-            if time.time() - start_time > self.timeout:
+            if time.time() - self.start_time > self.timeout:
                 print("Timeout reached. Saving progress...")
-                np.save(item_sim_path, self.item_similarity_matrix)
+                # Save current chunk
+                chunk_idx = i // save_chunk_size
+                chunk_data = self.item_similarity_matrix[i:i+save_chunk_size, :]
+                np.save(os.path.join(item_sim_dir, f'chunk_{chunk_idx}.npy'), chunk_data)
                 raise TimeoutError("Item similarity calculation timeout reached")
                 
             end_i = min(i + chunk_size, n_items)
@@ -161,6 +180,14 @@ class RecommendationSystem:
             chunk_similarities = cosine_similarity(chunk.T, self.user_item_matrix.T)
             self.item_similarity_matrix[i:end_i, :] = chunk_similarities
             
+            # Save completed chunks
+            for save_idx in range(i, end_i, save_chunk_size):
+                save_end = min(save_idx + save_chunk_size, end_i)
+                if save_end - save_idx == save_chunk_size:  # Only save complete chunks
+                    chunk_idx = save_idx // save_chunk_size
+                    chunk_data = self.item_similarity_matrix[save_idx:save_end, :]
+                    np.save(os.path.join(item_sim_dir, f'chunk_{chunk_idx}.npy'), chunk_data)
+            
             # Clear memory
             del chunk_similarities
             gc.collect()
@@ -168,42 +195,17 @@ class RecommendationSystem:
             # Save progress periodically
             if i % (chunk_size * 5) == 0:
                 print(f"Memory usage during item similarity calculation: {self._get_memory_usage():.2f} GB")
-                np.save(item_sim_path, self.item_similarity_matrix)
         
-        # Calculate user similarities in chunks
-        print("Calculating user similarities...")
-        user_sim_path = os.path.join(self.checkpoint_dir, 'user_similarity.npy')
-        
-        if os.path.exists(user_sim_path):
-            print("Loading existing user similarity matrix...")
-            self.user_similarity_matrix = np.load(user_sim_path)
-        else:
-            self.user_similarity_matrix = np.zeros((n_users, n_users))
-        
-        for i in tqdm(range(0, n_users, chunk_size), desc="Processing user chunks"):
-            if time.time() - start_time > self.timeout:
-                print("Timeout reached. Saving progress...")
-                np.save(user_sim_path, self.user_similarity_matrix)
-                raise TimeoutError("User similarity calculation timeout reached")
-                
-            end_i = min(i + chunk_size, n_users)
-            chunk = self.user_item_matrix[i:end_i, :]
-            
-            # Calculate similarities for this chunk
-            chunk_similarities = cosine_similarity(chunk, self.user_item_matrix)
-            self.user_similarity_matrix[i:end_i, :] = chunk_similarities
-            
-            # Clear memory
-            del chunk_similarities
-            gc.collect()
-            
-            # Save progress periodically
-            if i % (chunk_size * 5) == 0:
-                print(f"Memory usage during user similarity calculation: {self._get_memory_usage():.2f} GB")
-                np.save(user_sim_path, self.user_similarity_matrix)
+        # Calculate user similarities using sparse top-k approach
+        print("Calculating user similarities (sparse top-k)...")
+        self.user_similarity_matrix = compute_topk_user_similarities(self.user_item_matrix, k=self.top_k)
+        print(f"User similarity matrix shape: {self.user_similarity_matrix.shape}, nnz: {self.user_similarity_matrix.nnz}")
+        # Optionally, save to disk if needed
+        # from scipy.sparse import save_npz
+        # save_npz(os.path.join(self.checkpoint_dir, 'user_similarity_sparse.npz'), self.user_similarity_matrix)
     
     def get_hybrid_recommendations(self, user_id, n_recommendations=5, item_weight=0.5):
-        """Get hybrid recommendations with memory-efficient processing"""
+        """Get hybrid recommendations with memory-efficient processing (sparse user similarity)"""
         if user_id not in self.user_mapping:
             return []
         
@@ -216,8 +218,8 @@ class RecommendationSystem:
         top_items = np.argsort(item_scores)[-n_recommendations:][::-1]
         item_recs = [self.reverse_item_mapping[item] for item in top_items]
         
-        # Get user-based recommendations
-        similar_users = self.user_similarity_matrix[user_idx]
+        # Get user-based recommendations (sparse)
+        similar_users = self.user_similarity_matrix.getrow(user_idx).toarray().flatten()
         similar_users[user_idx] = -np.inf
         top_users = np.argsort(similar_users)[-n_recommendations:][::-1]
         
@@ -241,3 +243,18 @@ class RecommendationSystem:
         # Sort and return top recommendations
         recommendations = sorted(item_scores.items(), key=lambda x: x[1], reverse=True)
         return [item for item, score in recommendations[:n_recommendations]]
+
+def compute_topk_user_similarities(user_item_matrix, k=10):
+    # Fit NearestNeighbors on user vectors
+    nn = NearestNeighbors(n_neighbors=k+1, metric='cosine', algorithm='auto')
+    nn.fit(user_item_matrix)
+    distances, indices = nn.kneighbors(user_item_matrix)
+    
+    n_users = user_item_matrix.shape[0]
+    user_sim_matrix = lil_matrix((n_users, n_users))
+    
+    for i in range(n_users):
+        for j, dist in zip(indices[i][1:], distances[i][1:]):  # skip self (first neighbor)
+            user_sim_matrix[i, j] = 1 - dist  # similarity = 1 - cosine distance
+    
+    return user_sim_matrix.tocsr()
